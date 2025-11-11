@@ -28,6 +28,8 @@ int hello(int); // hello
 int sysinfo(int);
 int procinfo(void*);
 int sleep(int);
+int sched_statistics(void);
+int sched_tickets(int);
 
 // ulib.c
 int stat(const char*, struct stat*);

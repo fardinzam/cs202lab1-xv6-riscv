@@ -7,6 +7,8 @@
 #include "proc.h"
 #include "vm.h"
 
+extern struct proc proc[];
+
 uint64
 sys_exit(void)
 {
@@ -182,6 +184,51 @@ sys_procinfo(void)
   // Copy data to user space
   if(copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0)
     return -1;
+  
+  return 0;
+}
+
+uint64
+sys_sched_statistics(void)
+{
+  struct proc *p;
+  
+  // Iterate through all processes and print their statistics
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state != UNUSED) {
+      printf("%d(%s): tickets: %d, ticks: %d\n", 
+             p->pid, p->name, p->tickets, p->ticks);
+    }
+    release(&p->lock);
+  }
+  
+  return 0;
+}
+
+uint64
+sys_sched_tickets(void)
+{
+  int n;
+  struct proc *p = myproc();
+  
+  argint(0, &n);
+  
+  // Check maximum ticket constraint
+  if(n > 10000) {
+    return 0;  // Return 0 as specified, but don't update tickets
+  }
+  
+  acquire(&p->lock);
+  p->tickets = n;
+  // Update stride value for stride scheduler (K = 10000)
+  if(n > 0) {
+    p->stride = 10000 / n;
+  } else {
+    // If tickets is 0, set stride to a very large value so process is never selected
+    p->stride = 1000000;
+  }
+  release(&p->lock);
   
   return 0;
 }

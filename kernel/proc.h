@@ -105,4 +105,8 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
   int syscall_count;           // Number of system calls made by this process
+  int tickets;                 // # of lottery/stride scheduling tickets
+  int ticks;                   // # of times this process is scheduled
+  int stride;                  // stride scheduling stride value
+  int pass;                    // stride scheduling pass value
 };

@@ -26,6 +26,16 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+// pseudo random generator (https://stackoverflow.com/a/7603688)
+unsigned short lfsr = 0xACE1u;
+unsigned short bit;
+
+unsigned short rand(void)
+{
+  bit = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
+  return lfsr = (lfsr >> 1) | (bit << 15);
+}
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -125,6 +135,10 @@ found:
   p->pid = allocpid();
   p->state = USED;
   p->syscall_count = 0;  // Initialize per-process syscall counter
+  p->tickets = 10000;    // default value
+  p->ticks = 0;          // initialize counter
+  p->stride = 10000 / 10000;  // initialize stride value (K = 10000)
+  p->pass = 0;           // initialize pass value
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -291,6 +305,13 @@ kfork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  // get scheduling parameters from parent process
+  acquire(&p->lock);
+  np->tickets = p->tickets;
+  np->stride = p->stride;
+  np->pass = p->pass;
+  release(&p->lock);
+
   pid = np->pid;
 
   release(&np->lock);
@@ -438,6 +459,101 @@ scheduler(void)
     intr_on();
     intr_off();
 
+#if defined(LOTTERY)
+    // lottery scheduler
+    int total_tickets = 0;
+    struct proc *selected = 0;
+    
+    // find total tickets
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        total_tickets += p->tickets;
+      }
+      release(&p->lock);
+    }
+    
+    if(total_tickets > 0) {
+      // get a random ticket (0 to total_tickets-1)
+      unsigned short random_ticket = rand() % total_tickets;
+      int current_ticket = 0;
+      
+      // select process from random ticket
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          int prev_ticket = current_ticket;
+          current_ticket += p->tickets;
+          // check random_ticket is within ticket range
+          if(prev_ticket <= random_ticket && random_ticket < current_ticket && selected == 0) {
+            selected = p;
+          } else {
+            release(&p->lock);
+          }
+        } else {
+          release(&p->lock);
+        }
+      }
+      
+      if(selected != 0) {
+        // switch to chosen process
+        selected->state = RUNNING;
+        selected->ticks++;
+        c->proc = selected;
+        swtch(&c->context, &selected->context);
+        
+        // process is done for now
+        c->proc = 0;
+        release(&selected->lock);
+      } else {
+        // nothing to run; stop running on this core until interrupt
+        asm volatile("wfi");
+      }
+    } else {
+      // nothing to run; stop running on this core until an interrupt.
+      asm volatile("wfi");
+    }
+#elif defined(STRIDE)
+    // stride scheduler
+    struct proc *selected = 0;
+    int min_pass = -1;
+    
+    // find process with min pass value
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        if(selected == 0 || p->pass < min_pass) {
+          if(selected != 0) {
+            release(&selected->lock);
+          }
+          selected = p;
+          min_pass = p->pass;
+        } else {
+          release(&p->lock);
+        }
+      } else {
+        release(&p->lock);
+      }
+    }
+    
+    if(selected != 0) {
+      // switch to chosen process
+      selected->state = RUNNING;
+      selected->ticks++;
+      // update pass value
+      selected->pass += selected->stride;
+      c->proc = selected;
+      swtch(&c->context, &selected->context);
+      
+      // process is done for now
+      c->proc = 0;
+      release(&selected->lock);
+    } else {
+      // nothing to run; stop running on this core until interrupt
+      asm volatile("wfi");
+    }
+#else
+    // Original xv6 round-robin scheduler
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -446,6 +562,7 @@ scheduler(void)
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
+        p->ticks++;
         c->proc = p;
         swtch(&c->context, &p->context);
 
@@ -460,6 +577,7 @@ scheduler(void)
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
+#endif
   }
 }
 
