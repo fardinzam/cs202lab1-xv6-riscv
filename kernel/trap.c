@@ -116,6 +116,11 @@ prepare_return(void)
   p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
   p->trapframe->kernel_trap = (uint64)usertrap;
   p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
+  
+  // Set sscratch to the trapframe address for this thread
+  // so uservec can use it on the next trap
+  uint64 trapframe_addr = (p->thread_id == 0) ? TRAPFRAME : (TRAPFRAME - PGSIZE * p->thread_id);
+  w_sscratch(trapframe_addr);
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
@@ -147,7 +152,14 @@ kerneltrap()
 
   if((which_dev = devintr()) == 0){
     // interrupt or trap from an unknown source
-    printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
+    struct proc *p = myproc();
+    printf("kerneltrap: scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
+    if(p) {
+      printf("kerneltrap: pid=%d thread_id=%d trapframe=0x%lx sscratch=0x%lx\n",
+             p->pid, p->thread_id, (uint64)p->trapframe, r_sscratch());
+    } else {
+      printf("kerneltrap: no current process\n");
+    }
     panic("kerneltrap");
   }
 

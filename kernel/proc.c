@@ -139,6 +139,7 @@ found:
   p->ticks = 0;          // initialize counter
   p->stride = 10000 / 10000;  // initialize stride value (K = 10000)
   p->pass = 0;           // initialize pass value
+  p->thread_id = 0;      // 0 for parent process
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -164,6 +165,64 @@ found:
   return p;
 }
 
+// Allocate a thread (similar to allocproc but shares page table with parent)
+// p->lock must be held.
+static struct proc*
+allocproc_thread(struct proc *parent)
+{
+  struct proc *p;
+  int i;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->state = USED;
+  p->syscall_count = 0;
+  p->tickets = parent->tickets;
+  p->ticks = 0;
+  p->stride = parent->stride;
+  p->pass = parent->pass;
+  p->thread_id = 0;  // Will be set by clone()
+
+  // Allocate a trapframe page.
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Share the parent's page table (don't create a new one)
+  p->pagetable = parent->pagetable;
+  p->sz = parent->sz;
+
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  // duplicate open file descriptors from parent
+  for(i = 0; i < NOFILE; i++) {
+    if(parent->ofile[i])
+      p->ofile[i] = filedup(parent->ofile[i]);
+  }
+
+  // duplicate current working directory
+  if(parent->cwd)
+    p->cwd = idup(parent->cwd);
+
+  return p;
+}
+
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -184,6 +243,37 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->thread_id = 0;
+}
+
+// free a thread structure (only thread-local resources)
+// does not free the shared page table
+// p->lock must be held.
+static void
+freeproc_thread(struct proc *p)
+{
+  uint64 trapframe_addr;
+  
+  // Unmap the trapframe page for this thread
+  if(p->thread_id > 0 && p->pagetable) {
+    trapframe_addr = TRAPFRAME - PGSIZE * p->thread_id;
+    uvmunmap(p->pagetable, trapframe_addr, 1, 0);
+  }
+  
+  if(p->trapframe)
+    kfree((void*)p->trapframe);
+  p->trapframe = 0;
+  // Do NOT free the shared page table
+  p->pagetable = 0;  // Just clear the pointer, don't free
+  p->sz = 0;
+  p->pid = 0;
+  p->parent = 0;
+  p->name[0] = 0;
+  p->chan = 0;
+  p->killed = 0;
+  p->xstate = 0;
+  p->state = UNUSED;
+  p->thread_id = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -327,6 +417,93 @@ kfork(void)
   return pid;
 }
 
+// Create a new thread, sharing the parent's address space.
+// Sets up child kernel stack to return as if from clone() system call.
+int
+kclone(uint64 stack)
+{
+  int pid, thread_id;
+  struct proc *np;
+  struct proc *p = myproc();
+  uint64 trapframe_addr;
+
+  // Sanity check: stack must not be null
+  if(stack == 0) {
+    return -1;
+  }
+
+  // Find next available thread_id for this parent
+  // Count existing threads with same parent
+  thread_id = 0;
+  acquire(&wait_lock);
+  for(np = proc; np < &proc[NPROC]; np++){
+    acquire(&np->lock);
+    if(np->parent == p && np->thread_id > 0){
+      if(np->thread_id > thread_id)
+        thread_id = np->thread_id;
+    }
+    release(&np->lock);
+  }
+  thread_id++;  // Next thread ID
+  if(thread_id > 20) {  // Max 20 threads per process
+    release(&wait_lock);
+    return -1;
+  }
+  release(&wait_lock);
+
+  // Allocate thread.
+  if((np = allocproc_thread(p)) == 0){
+    return -1;
+  }
+
+  np->thread_id = thread_id;
+
+  // Map the trapframe page for this thread at TRAPFRAME - PGSIZE * thread_id
+  trapframe_addr = TRAPFRAME - PGSIZE * thread_id;
+  
+  if(mappages(p->pagetable, trapframe_addr, PGSIZE,
+              (uint64)(np->trapframe), PTE_R | PTE_W) < 0){
+    kfree((void*)np->trapframe);
+    np->trapframe = 0;
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
+  // copy saved user registers from parent.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Initialize kernel fields for the child thread
+  // These need to be set correctly so the first trap works
+  np->trapframe->kernel_sp = np->kstack + PGSIZE;  // child's kernel stack
+  // kernel_satp, kernel_trap, and kernel_hartid will be set by prepare_return()
+  // but we need kernel_sp to be correct from the start
+
+  // Set child's stack pointer to the provided stack
+  np->trapframe->sp = stack;
+
+  // Cause clone to return 0 in the child.
+  np->trapframe->a0 = 0;
+
+  // Do not copy file descriptors (as per lab instructions)
+
+  safestrcpy(np->name, p->name, sizeof(np->name));
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
+
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
 void
@@ -416,7 +593,12 @@ kwait(uint64 addr)
             release(&wait_lock);
             return -1;
           }
-          freeproc(pp);
+          // If this is a thread (thread_id > 0), only free thread-local resources
+          if(pp->thread_id > 0) {
+            freeproc_thread(pp);
+          } else {
+            freeproc(pp);
+          }
           release(&pp->lock);
           release(&wait_lock);
           return pid;
@@ -653,7 +835,9 @@ forkret(void)
   prepare_return();
   uint64 satp = MAKE_SATP(p->pagetable);
   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
-  ((void (*)(uint64))trampoline_userret)(satp);
+  // For threads, use different trapframe location
+  uint64 trapframe_addr = (p->thread_id == 0) ? TRAPFRAME : (TRAPFRAME - PGSIZE * p->thread_id);
+  ((void (*)(uint64, uint64))trampoline_userret)(trapframe_addr, satp);
 }
 
 // Sleep on channel chan, releasing condition lock lk.

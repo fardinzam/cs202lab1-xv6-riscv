@@ -109,4 +109,5 @@ struct proc {
   int ticks;                   // # of times this process is scheduled
   int stride;                  // stride scheduling stride value
   int pass;                    // stride scheduling pass value
+  int thread_id;               // thread ID: 0 for parent, >0 for child threads
 };
